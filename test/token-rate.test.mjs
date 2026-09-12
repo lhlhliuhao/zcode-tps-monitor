@@ -143,7 +143,21 @@ test("doctor:夹具环境全部通过", async () => {
   fs.writeFileSync(path.join(tmp, ".zcode", "tps-monitor.last-session.json"),
     JSON.stringify({ sessionId: "sess_test", ts: Date.now(), source: "test" }));
   process.env.ZCODE_USAGE_DB = dbFile; // doctor 同样在加载时读取该变量
-  const { runDoctor } = await import(pathToFileURL(path.join(PLUGIN, "scripts", "doctor.mjs")).href);
-  const report = await runDoctor();
-  assert.equal(report.failed, 0, JSON.stringify(report.checks, null, 2));
+  // doctor 在模块加载时用 os.homedir() 解析 ~/.zcode 状态目录:临时把 HOME/USERPROFILE
+  // 指向夹具目录做环境隔离(POSIX 读 HOME,Windows 读 USERPROFILE),
+  // 否则在无 ~/.zcode 的干净环境(CI)上"会话状态文件"检查必然失败
+  const prevHome = process.env.HOME;
+  const prevUserProfile = process.env.USERPROFILE;
+  process.env.HOME = tmp;
+  process.env.USERPROFILE = tmp;
+  try {
+    const { runDoctor } = await import(pathToFileURL(path.join(PLUGIN, "scripts", "doctor.mjs")).href);
+    const report = await runDoctor();
+    assert.equal(report.failed, 0, JSON.stringify(report.checks, null, 2));
+  } finally {
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = prevUserProfile;
+  }
 });
