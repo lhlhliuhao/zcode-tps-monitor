@@ -1,3 +1,5 @@
+<img src="assets/icon.png" align="right" width="96" alt="zcode-tps-monitor 图标">
+
 # zcode-tps-monitor
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
