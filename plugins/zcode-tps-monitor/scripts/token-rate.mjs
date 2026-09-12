@@ -14,6 +14,7 @@ process.removeAllListeners("warning");
 process.on("warning", () => {});
 
 const { DatabaseSync } = await import("node:sqlite");
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -135,7 +136,20 @@ function latestTurnId(db, sid) {
   }
 }
 
-function queryTurn(sessionId) {
+// 最近一次用户提问的时间戳(prompt-submit 钩子写入);--current 守卫用:
+// 最新 turn 的所有行都早于它,说明本问尚未产生任何模型请求(纯问答轮),不得当作"本问"统计。
+function lastPromptTs() {
+  try {
+    const st = JSON.parse(
+      fs.readFileSync(path.join(os.homedir(), ".zcode", "tps-monitor.last-session.json"), "utf8")
+    );
+    return Number.isFinite(st.ts) ? st.ts : null;
+  } catch {
+    return null;
+  }
+}
+
+function queryTurn(sessionId, opts = {}) {
   const db = openDb();
   try {
     let sid = sessionId;
@@ -158,6 +172,15 @@ function queryTurn(sessionId) {
       return { sessionId: sid, turnId: null, turn: null, session };
     }
     if (!turnRows.length) return { sessionId: sid, turnId, turn: null, session };
+    // --current 守卫:最新 turn 的行全部早于本次提问时刻 → 本问还没有任何模型请求
+    // (典型场景:纯问答轮在回答结束前),绝不把上一轮数据冒充"本问"返回。
+    if (opts.current) {
+      const ts = lastPromptTs();
+      const lastAt = Math.max(...turnRows.map((r) => r.completed_at ?? 0));
+      if (ts && lastAt < ts) {
+        return { sessionId: sid, turnId, turn: null, noCurrentTurnData: true, session };
+      }
+    }
     const items = turnRows.map(toItem);
     const rated = items.filter((i) => i.tokPerSec != null);
     const totalTok = rated.reduce((s, i) => s + i.outputTokens + i.reasoningTokens, 0);
@@ -233,11 +256,13 @@ function formatTurnLine(r) {
 if (process.argv[1] && process.argv[1].endsWith("token-rate.mjs")) {
   const json = process.argv.includes("--json");
   const turnOnly = process.argv.includes("--turn");
+  const current = process.argv.includes("--current");
   const sid = process.env.ZCODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || null;
   if (turnOnly) {
-    const r = queryTurn(sid);
+    const r = queryTurn(sid, { current });
     if (json) console.log(JSON.stringify(r, null, 2));
-    else console.log(formatTurnLine(r));
+    else if (r.turn) console.log(formatTurnLine(r));
+    // --current 且本问尚无数据:不输出任何行,调用方据此不显示统计(绝不回退到上一轮)
   } else {
     const r = query(sid);
     if (json) {
