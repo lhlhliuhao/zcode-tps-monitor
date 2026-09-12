@@ -67,16 +67,12 @@ const WHITE = [255, 255, 255];
 
 // ---------- 场景参数(以 256 坐标系描述,绘制时乘 SS) ----------
 const S = SIZE / 256;
-const C = [128, 132];              // 表盘中心
-const R = 76;                      // 弧半径
+const C = [128, 124];              // 表盘中心(水平居中)
+const R = 64;                      // 弧半径
+const RING = 13;                   // 环半宽
 const A0 = 135, SWEEP = 270;       // 起点左下,顺时针 270°
-const PROG = 0.74;                 // 进度占比(高速)
+const PROG = 0.72;                 // 进度占比(高速)
 const NEEDLE_A = A0 + SWEEP * PROG;
-const BARS = [ // [中心x, 宽, 高]  底部吞吐柱
-  [106, 15, 18],
-  [128, 15, 30],
-  [150, 15, 44],
-];
 
 function coverage(px, py) {
   // 背景:圆角方 + 对角渐变 + 顶部微光
@@ -89,45 +85,36 @@ function coverage(px, py) {
   const aa = 0.8 * SS; // 1px@输出分辨率 的过渡带
   const cov = (d) => Math.min(1, Math.max(0, 0.5 - d / (aa * 2)));
 
-  // 表盘轨道(半透明白)
-  const track = arcDist(px, py, C[0] * S, C[1] * S, R * S, 9 * S, A0, A0 + SWEEP);
+  // 表盘轨道(半透明白,足够亮以保证整圈可见)
+  const track = arcDist(px, py, C[0] * S, C[1] * S, R * S, RING * S, A0, A0 + SWEEP);
   const tCov = cov(track);
-  if (tCov > 0) col = mix(col, TRACK, tCov * 0.22);
+  if (tCov > 0) col = mix(col, TRACK, tCov * 0.30);
 
-  // 进度弧:青→绿渐变 + 外发光
+  // 进度弧:青→绿渐变 + 轻微外发光
   const a1 = A0 + SWEEP * PROG;
-  const prog = arcDist(px, py, C[0] * S, C[1] * S, R * S, 9 * S, A0, a1);
+  const prog = arcDist(px, py, C[0] * S, C[1] * S, R * S, RING * S, A0, a1);
   const pCov = cov(prog);
   if (pCov > 0) {
     const t = Math.min(1, Math.max(0, ((Math.atan2(py - C[1] * S, px - C[0] * S) * 180) / Math.PI - A0 + 360) % 360 / (SWEEP * PROG)));
     col = mix(col, mix(GLOW, FAST, t), pCov);
   }
-  const halo = Math.max(0, 1 - Math.max(0, prog - 9 * S) / (26 * S));
-  if (halo > 0 && prog > 0) col = mix(col, GLOW, halo * halo * 0.18);
+  const halo = Math.max(0, 1 - Math.max(0, prog - RING * S) / (18 * S));
+  if (halo > 0 && prog > 0) col = mix(col, GLOW, halo * halo * 0.15);
 
-  // 指针:白,圆帽;末端指向高速区
+  // 指针:白,圆帽;止于弧内侧,留出间隙
   const nA = (NEEDLE_A * Math.PI) / 180;
-  const tip = [C[0] * S + (R - 24) * S * Math.cos(nA), C[1] * S + (R - 24) * S * Math.sin(nA)];
-  const needle = sdSegment(px, py, C[0] * S, C[1] * S, tip[0], tip[1], 5.5 * S);
+  const tip = [C[0] * S + (R - RING - 9) * S * Math.cos(nA), C[1] * S + (R - RING - 9) * S * Math.sin(nA)];
+  const needle = sdSegment(px, py, C[0] * S, C[1] * S, tip[0], tip[1], 7 * S);
   const nCov = cov(needle);
   if (nCov > 0) col = mix(col, WHITE, nCov);
 
   // 轴心:白圆 + 中心色点
-  const hub = sdCircle(px, py, C[0] * S, C[1] * S, 11 * S);
+  const hub = sdCircle(px, py, C[0] * S, C[1] * S, 12 * S);
   const hCov = cov(hub);
   if (hCov > 0) col = mix(col, WHITE, hCov);
-  const hubDot = sdCircle(px, py, C[0] * S, C[1] * S, 4.5 * S);
+  const hubDot = sdCircle(px, py, C[0] * S, C[1] * S, 5 * S);
   const dCov = cov(hubDot);
   if (dCov > 0) col = mix(col, BG_TOP, dCov);
-
-  // 底部吞吐柱(三根渐高的白色柱,透明度递增)
-  for (let i = 0; i < BARS.length; i++) {
-    const [bx, bw, bh] = BARS[i];
-    const top = 226 * S - bh * S;
-    const bar = sdRoundedRect(px, py, bx * S, (top + 226 * S) / 2, bw * S / 2, (226 * S - top) / 2, bw * S * 0.3);
-    const bCov = cov(bar);
-    if (bCov > 0) col = mix(col, WHITE, bCov * (0.38 + i * 0.29));
-  }
 
   const bgCov = cov(bg);
   return { col, a: bgCov };
