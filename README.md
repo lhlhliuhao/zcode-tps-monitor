@@ -4,31 +4,31 @@
 ![Node](https://img.shields.io/badge/node-%E2%89%A5%2022.5-brightgreen)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
 
-**ZCode 会话级 Token 速率监控插件。** 每轮对话自动在回复末尾显示真实 tok/s —— 数据直接读取 ZCode usage 数据库,非模型自述、非估算;另附实时监控大屏、斜杠命令、MCP 工具与可选的业务 TPS 监控。
+**ZCode 会话级 Token 速率监控插件。** 每轮回复结束时自动显示**本轮即时** tok/s —— 数据直接读取 ZCode usage 数据库,非模型自述、非估算;另附实时监控大屏、斜杠命令、MCP 工具与可选的业务 TPS 监控。
 
 > 本仓库同时是一个 ZCode 本地插件市场(marketplace 名称:`tps-local-marketplace`),插件本体位于 [`plugins/zcode-tps-monitor/`](plugins/zcode-tps-monitor/README.md)。
 
 ## 效果预览
 
-每轮回复末尾自动注入一行速率指标,无需任何手动操作。行在用户发送消息的瞬间采样,因此描述的是**上一条已完成回复**的速率(当前回复的速度会在下一轮的行中显示):
+每轮回复结束时自动显示一行速率指标,无需任何手动操作。行在回复刚结束的瞬间采样(Stop 钩子),头条就是**本轮的即时速率**——多段工具调用的长轮次按"总产出 / 总生成时长"加权:
 
 ![token 速率行效果](plugins/zcode-tps-monitor/docs/effect-token-rate.png)
 
 | 字段 | 含义 |
 |---|---|
-| `537.3 tok/s` | 上一条已完成回复的输出速率(含思考 token) |
-| `首字 3.0s` | 首 token 延迟(TTFT) |
-| `输出 223 tok / 生成 0.4s` | 该回复的输出 token 数与生成耗时 |
+| `537.3 tok/s` | 本轮即时输出速率(含思考 token;多段轮次为加权速率) |
+| `首字 3.0s` | 首 token 延迟(TTFT,本轮第一段) |
+| `输出 223 tok / 生成 0.4s` | 本轮输出 token 数与纯生成耗时(不含段间工具等待) |
+| `2 段 / 峰 537.3` | 本轮的请求段数与单段峰值速率(多段轮次才显示) |
 | `近3次均 494.9` | 最近数轮滑动平均 |
-| `峰 537.3` | 当前会话峰值 |
 | `累计 51.3k tok` | 当前会话累计输出(独立统计,不受窗口限制) |
-| `⏱ 10:23:04` | 采样时刻(用户发送消息时间) |
+| `⏱ 10:23:04` | 采样时刻(回复结束时间) |
 
 数字显示规则:每轮「输出」用千分位精确数字(如 `2,762 tok`);「累计」用紧凑单位——千以下原始、1k~1万一位小数(`9.8k`)、1万~100万取整(`51k`)、百万以上一位小数 M(`73.8M`)。
 
 ## 功能特性
 
-- **真实 Token 速率注入(默认开启)** —— 每轮回复末尾自动显示 tok/s(含思考 token)、首字延迟、输出 token 数、生成耗时、近几轮均值/峰值与会话累计
+- **真实 Token 速率注入(默认开启)** —— 每轮回复结束时自动显示本轮即时 tok/s(含思考 token)、首字延迟、输出 token 数、生成耗时、段数/峰值与会话累计
 - **实时监控大屏** —— `/zcode-tps-monitor:dashboard` 一键拉起,浏览器深色运维风格面板,秒级自动刷新;空闲 3 小时自动退出,不留后台进程
 - **斜杠命令** —— `/tps` 即时快照;`/tps 10` 采样观察 10 秒;`/tps-doctor` 环境自检
 - **MCP 工具** —— `tps_snapshot` / `tps_watch`,供 agent 程序化取数
@@ -62,11 +62,12 @@
 
 | 场景 | 操作 |
 |---|---|
-| 查看每轮速率 | 无需操作,每轮回复末尾自动显示 |
+| 查看每轮速率 | 无需操作,每轮回复结束时自动显示本轮即时速率 |
 | 即时快照 | 输入 `/tps`;或 `/tps 10` 持续采样 10 秒 |
 | 打开监控大屏 | 输入 `/zcode-tps-monitor:dashboard`,或手动 `node dashboard/server.mjs` |
 | 环境自检 | 速率行不见了?输入 `/tps-doctor` 逐项排查 |
-| 关闭每轮注入 | `~/.zcode/tps-monitor.config.json` 写入 `{"tokenRateLine": false}`,重开会话生效 |
+| 关闭本轮即时行 | `~/.zcode/tps-monitor.config.json` 写入 `{"stopHookLine": false}`,重开会话生效 |
+| 关闭全部速率注入 | 同文件写入 `{"tokenRateLine": false}`,重开会话生效 |
 | 桌面悬浮条 | 运行 `dashboard/overlay.ps1`(Windows) |
 | agent 取数 | MCP 工具 `tps_snapshot` / `tps_watch` |
 
@@ -95,14 +96,21 @@
    │
    ▼
 UserPromptSubmit 钩子
-   │  读取 ZCode usage 数据库(model_usage 表),
-   │  按当前会话计算本轮/均值/峰值速率
+   │  读取 ZCode usage 数据库,注入上一轮速率作模型上下文
    ▼
-将速率行注入模型上下文 → 回复末尾原样展示
+模型回复(工具调用 × N 段)
+   │
+   ▼
+Stop 钩子(回复刚结束,本轮已全部入库)
+   │  按最新 turn_id 圈定本轮全部请求,
+   │  计算即时速率(总产出 / 总纯生成时长)
+   ▼
+systemMessage 直接显示本轮速率行
 ```
 
 - **SessionStart 钩子**:会话启动时记录当前会话 ID 并注入使用提示
-- **UserPromptSubmit 钩子**:每轮触发一次,单次为毫秒级数据库读取,开销可忽略
+- **UserPromptSubmit 钩子**:每轮触发一次,单次为毫秒级数据库读取,开销可忽略;此刻本轮尚未发生,因此只注入上一轮数据作上下文
+- **Stop 钩子**:回复刚结束、本轮数据已完整入库的瞬间触发,按 `turn_id` 精确圈定本轮(一次用户消息触发的全部请求,含多段工具调用),经 `systemMessage` 由客户端直接显示——无需模型转发,天然零滞后
 - Token 速率与业务 TPS 相互独立:前者始终来自 ZCode 真实数据,后者取决于是否配置 `metrics_url`
 
 ## 常见问题

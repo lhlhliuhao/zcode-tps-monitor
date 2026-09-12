@@ -27,21 +27,22 @@ const { DatabaseSync } = await import("node:sqlite");
   db.exec(`CREATE TABLE model_usage (
     session_id TEXT, status TEXT, query_source TEXT, model_id TEXT,
     output_tokens INTEGER, reasoning_tokens INTEGER, input_tokens INTEGER, cache_read_input_tokens INTEGER,
-    first_token_at INTEGER, completed_at INTEGER, time_to_first_token_ms INTEGER)`);
+    first_token_at INTEGER, completed_at INTEGER, time_to_first_token_ms INTEGER, turn_id TEXT)`);
   const ins = db.prepare(
-    "INSERT INTO model_usage VALUES (?, 'completed', 'main_turn', 'test-model', ?, ?, 120000, 118000, ?, ?, ?)"
+    "INSERT INTO model_usage VALUES (?, 'completed', 'main_turn', 'test-model', ?, ?, 120000, 118000, ?, ?, ?, ?)"
   );
-  // 速率 = (output + reasoning) / genMs
-  ins.run("s1", 500, 100, 1000, 2000, 800);  // gen 1000ms → 600 tok/s(验证思考 token 计入分子)
-  ins.run("s1", 900, 0, 2000, 5000, 700);    // gen 3000ms → 300 tok/s
-  ins.run("s1", 80, 0, 6500, 7000, 450);     // gen 500ms  → 160 tok/s(最近有效 = 头条)
-  ins.run("s1", 20, 0, 7550, 7600, 100);     // gen 50ms < MIN → 无速率,但计入累计
+  // 速率 = (output + reasoning) / genMs;turn_id 按用户轮次分组,本轮 = 最新 turn_id
+  ins.run("s1", 500, 100, 1000, 2000, 800, "t_old");  // gen 1000ms → 600 tok/s(验证思考 token 计入分子)
+  ins.run("s1", 900, 0, 2000, 5000, 700, "t_old");    // gen 3000ms → 300 tok/s
+  ins.run("s1", 80, 0, 6500, 7000, 450, "t_new");     // gen 500ms  → 160 tok/s(本轮第 1 段)
+  ins.run("s1", 20, 0, 7550, 7600, 100, "t_new");     // gen 50ms < MIN → 无速率,但计入累计
+  ins.run("s1", 220, 0, 9000, 10100, 600, "t_new");   // gen 1100ms → 200 tok/s(本轮第 2 段 = 会话最新)
   // 非 main_turn:主对话存在时必须被排除
-  db.exec("INSERT INTO model_usage VALUES ('s1', 'completed', 'sub', 'test-model', 999, 0, 120000, 118000, 8000, 9000, 500)");
+  db.exec("INSERT INTO model_usage VALUES ('s1', 'completed', 'sub', 'test-model', 999, 0, 120000, 118000, 8000, 9000, 500, 't_new')");
   db.close();
 }
 
-const { query, formatLine, fmtCompact, fmtNum } = await import(pathToFileURL(path.join(PLUGIN, "scripts", "token-rate.mjs")).href);
+const { query, queryTurn, formatLine, formatTurnLine, fmtCompact, fmtNum } = await import(pathToFileURL(path.join(PLUGIN, "scripts", "token-rate.mjs")).href);
 
 // --- 换算规则 ---
 test("fmtCompact 分档:<1k 原始、1k~1w 一位小数、1w~100w 取整 k、≥100w 一位小数 M", () => {
@@ -69,7 +70,7 @@ test("速率含思考 token:600 = (500+100)/1s", () => {
 
 test("头条取最近有效样本,且排除无效与非主对话行", () => {
   const r = query("s1");
-  assert.equal(r.latest.tokPerSec, 160);       // 最近有效是 gen 500ms 那条,而非 gen 50ms / sub 行
+  assert.equal(r.latest.tokPerSec, 200);       // 最近有效是本轮第 2 段(gen 1100ms),而非 gen 50ms / sub 行
   assert.ok(r.history.every((h) => h.outputTokens !== 999)); // sub 行被过滤
   const invalid = r.history.find((h) => h.outputTokens === 20);
   assert.equal(invalid.tokPerSec, null);        // 过短生成无速率
@@ -77,19 +78,63 @@ test("头条取最近有效样本,且排除无效与非主对话行", () => {
 
 test("窗口统计与会话累计(独立 SUM,不受窗口限制)", () => {
   const r = query("s1");
-  assert.equal(r.session.samples, 3);
-  assert.equal(r.session.avg, 353.3);          // (600+300+160)/3
+  assert.equal(r.session.samples, 4);
+  assert.equal(r.session.avg, 315);            // (600+300+160+200)/4
   assert.equal(r.session.max, 600);
-  assert.equal(r.session.totalOutput, 1500);   // 500+900+80+20(含无效速率行)
+  assert.equal(r.session.totalOutput, 1720);   // 500+900+80+20+220(含无效速率行)
   assert.equal(r.session.totalReasoning, 100);
-  assert.equal(r.session.requests, 4);         // 4 条 main_turn(sub 不计)
+  assert.equal(r.session.requests, 5);         // 5 条 main_turn(sub 不计)
 });
 
 test("行文案:上轮标注、思考 token、会话累计", () => {
   const line = formatLine(query("s1"));
   assert.match(line, /\(上轮\)/);
-  assert.match(line, /近3次均 353\.3 \/ 峰 600/);
-  assert.match(line, /累计 1\.6k tok/);         // 1500+100
+  assert.match(line, /近4次均 315 \/ 峰 600/);
+  assert.match(line, /累计 1\.8k tok/);         // 1720+100
+});
+
+test("本轮统计:按最新 turn_id 圈定,多段加权速率", () => {
+  const r = queryTurn("s1");
+  assert.equal(r.turnId, "t_new");             // 只圈最新一轮,不含 t_old 两段
+  assert.equal(r.turn.requests, 3);            // 160 + 无效 50ms + 200
+  assert.equal(r.turn.rated, 2);
+  assert.equal(r.turn.totalOutput, 320);       // 80+20+220
+  assert.equal(r.turn.ttftMs, 450);            // 本轮第一段的首字延迟
+  // 加权:有效段 300 tok / 1600ms → 187.5(总产出/总生成时长,非各段速率均值)
+  assert.equal(r.turn.tokPerSec, 187.5);
+  assert.equal(r.turn.peak, 200);
+  assert.equal(r.session.samples, 4);          // 会话累计仍是全会话口径
+});
+
+test("本轮文案:本轮标注、段数峰值、会话累计", () => {
+  const line = formatTurnLine(queryTurn("s1"));
+  assert.match(line, /⚡ 187\.5 tok\/s\(本轮\)/);
+  assert.match(line, /首字 0\.5s/);
+  assert.match(line, /输出 320 tok \/ 生成/);
+  assert.match(line, /3 段 \/ 峰 200/);
+  assert.match(line, /累计 1\.8k tok/);
+});
+
+test("旧库无 turn_id 列:本轮查询优雅降级不抛错", async () => {
+  const legacyFile = path.join(tmp, "legacy.sqlite");
+  const db = new DatabaseSync(legacyFile);
+  db.exec(`CREATE TABLE model_usage (
+    session_id TEXT, status TEXT, query_source TEXT, model_id TEXT,
+    output_tokens INTEGER, reasoning_tokens INTEGER, input_tokens INTEGER, cache_read_input_tokens INTEGER,
+    first_token_at INTEGER, completed_at INTEGER, time_to_first_token_ms INTEGER)`);
+  db.exec("INSERT INTO model_usage VALUES ('s2', 'completed', 'main_turn', 'm', 100, 0, 100000, 99000, 1000, 2000, 500)");
+  db.close();
+  // DB 路径在模块加载时读取:带 query 重导入一份模块实例指向旧库
+  process.env.ZCODE_USAGE_DB = legacyFile;
+  try {
+    const legacy = await import(pathToFileURL(path.join(PLUGIN, "scripts", "token-rate.mjs")).href + "?legacy");
+    const r = legacy.queryTurn("s2");
+    assert.equal(r.turnId, null);
+    assert.equal(r.turn, null);
+    assert.equal(r.session.samples, 1);        // 会话统计不受影响
+  } finally {
+    process.env.ZCODE_USAGE_DB = dbFile;
+  }
 });
 
 // --- doctor:对夹具环境应全绿 ---

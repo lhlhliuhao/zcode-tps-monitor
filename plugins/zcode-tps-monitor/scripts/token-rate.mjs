@@ -2,6 +2,7 @@
 // Token 输出速率:从 ZCode 自身的 usage 数据库(model_usage 表)计算真实的模型生成速率。
 // 用法:
 //   node token-rate.mjs            最近一次请求 + 会话统计(人类可读)
+//   node token-rate.mjs --turn     本轮(刚结束的用户轮次)即时速率
 //   node token-rate.mjs --json     JSON 输出
 //   ZCODE_SESSION_ID=xxx node ...  只统计指定会话
 //   ZCODE_USAGE_DB=/path/db.sqlite 指定数据库路径(默认按用户主目录解析)
@@ -25,81 +26,156 @@ const HIST = Number(process.env.TOKEN_RATE_HIST) || 60;         // 曲线历史�
 const MIN_GEN_MS = Number(process.env.TOKEN_RATE_MIN_MS) || 200;      // 有效样本:最短生成耗时
 const MAX_GEN_MS = Number(process.env.TOKEN_RATE_MAX_MS) || 3_600_000; // 有效样本:最长生成耗时(1h)
 
+function openDb() {
+  return new DatabaseSync(DB_PATH, { readOnly: true });
+}
+
+// 未显式指定会话时,取最近一次完成请求所属的会话 = 当前会话
+function resolveSession(db, sessionId) {
+  let sid = sessionId;
+  const scoped = sessionId ? "explicit" : "auto";
+  if (!sid) {
+    const row = db
+      .prepare("SELECT session_id FROM model_usage WHERE status = 'completed' ORDER BY completed_at DESC LIMIT 1")
+      .get();
+    sid = row ? row.session_id : null;
+  }
+  return { sid, scoped };
+}
+
+// 主对话优先的过滤范围:有 main_turn 数据时只统计 main_turn,否则回退为全部请求
+function scopeFor(db, sid) {
+  const base =
+    "SELECT model_id, output_tokens, reasoning_tokens, input_tokens, cache_read_input_tokens," +
+    " first_token_at, completed_at, time_to_first_token_ms, status" +
+    " FROM model_usage WHERE status = 'completed' AND query_source = 'main_turn'";
+  const args = sid ? [sid] : [];
+  const hasMain = db
+    .prepare(base + (sid ? " AND session_id = ?" : "") + " LIMIT 1")
+    .get(...args);
+  const scopeSql = hasMain
+    ? base + " AND session_id = ?"
+    : base.replace(" AND query_source = 'main_turn'", "") + (sid ? " AND session_id = ?" : "");
+  return { scopeSql, args };
+}
+
+function toItem(r) {
+  const tok = r.output_tokens ?? 0;
+  const reasoning = r.reasoning_tokens ?? 0;
+  // 部分行(如非流式/中断请求)缺 first_token_at,须判无效
+  const hasTime = Number.isFinite(r.first_token_at) && Number.isFinite(r.completed_at) && r.completed_at > r.first_token_at;
+  const genMs = hasTime ? r.completed_at - r.first_token_at : null; // 纯生成耗时(不含首 token 等待)
+  // 速率分子含思考 token:思考内容同样是流式输出,ZCode 未单独记录时该列为 0,行为不变
+  const rateTokens = tok + reasoning;
+  const valid = genMs != null && genMs >= MIN_GEN_MS && genMs < MAX_GEN_MS && rateTokens > 0;
+  return {
+    model: r.model_id,
+    outputTokens: tok,
+    reasoningTokens: reasoning,
+    inputTokens: r.input_tokens ?? 0,
+    cacheRead: r.cache_read_input_tokens ?? 0,
+    ttftMs: Number.isFinite(r.time_to_first_token_ms) ? r.time_to_first_token_ms : null,
+    genMs,
+    tokPerSec: valid ? Math.round((rateTokens / genMs) * 10000) / 10 : null,
+    completedAt: r.completed_at,
+  };
+}
+
+// 会话累计用独立 SUM(不受展示窗口限制);速率均值/峰值由调用方按窗口传入
+function sessionAggregate(db, scopeSql, args, rated) {
+  if (!rated.length) return null;
+  const sumRow = db
+    .prepare(
+      "SELECT COUNT(*) n, SUM(output_tokens) o, SUM(reasoning_tokens) r," +
+      " SUM(input_tokens) i, SUM(cache_read_input_tokens) c FROM (" + scopeSql + ")"
+    )
+    .get(...args);
+  return {
+    samples: rated.length,
+    requests: sumRow.n ?? 0,
+    avg: Math.round((rated.reduce((s, i) => s + i.tokPerSec, 0) / rated.length) * 10) / 10,
+    max: Math.max(...rated.map((i) => i.tokPerSec)),
+    min: Math.min(...rated.map((i) => i.tokPerSec)),
+    totalOutput: sumRow.o ?? 0,
+    totalReasoning: sumRow.r ?? 0,
+    totalInput: sumRow.i ?? 0,
+    totalCacheRead: sumRow.c ?? 0,
+  };
+}
+
 function query(sessionId) {
-  const db = new DatabaseSync(DB_PATH, { readOnly: true });
+  const db = openDb();
   try {
-    // 未显式指定会话时,取最近一次完成请求所属的会话 = 当前会话
+    const { sid, scoped } = resolveSession(db, sessionId);
+    const { scopeSql, args } = scopeFor(db, sid);
+    // 曲线历史(大窗口)与统计(小窗口)分别查询,刷新/重开不丢
+    const histRows = db.prepare(scopeSql + " ORDER BY completed_at DESC LIMIT ?").all(...args, HIST);
+    const items = histRows.slice(0, N).map(toItem);
+    const rated = items.filter((i) => i.tokPerSec != null);
+    // 展示用 latest 优先取最近一条"有效"记录,避免在途/缺字段行顶掉头条
+    const latest = rated[0] ?? items[0] ?? null;
+    const session = sessionAggregate(db, scopeSql, args, rated);
+    return { sessionId: sid, scoped, latest, session, history: items.slice().reverse() };
+  } finally {
+    db.close();
+  }
+}
+
+// 本轮 = 会话里最新的 turn_id(一次用户消息触发的全部请求共享同一个 turn_id,
+// 含"模型→工具→模型"的每一段)。Stop 钩子在回复刚结束时调用,此时本轮已全部入库,
+// 因此能给出真正的"本轮即时速率";而 prompt-submit 时刻本轮尚未发生,只能看到上一轮。
+function latestTurnId(db, sid) {
+  try {
+    const row = db
+      .prepare("SELECT turn_id FROM model_usage WHERE session_id = ? AND turn_id IS NOT NULL ORDER BY completed_at DESC LIMIT 1")
+      .get(sid);
+    return row ? row.turn_id : null;
+  } catch {
+    return null; // 旧版客户端的库没有 turn_id 列
+  }
+}
+
+function queryTurn(sessionId) {
+  const db = openDb();
+  try {
     let sid = sessionId;
-    let scoped = sessionId ? "explicit" : "auto";
     if (!sid) {
       const row = db
         .prepare("SELECT session_id FROM model_usage WHERE status = 'completed' ORDER BY completed_at DESC LIMIT 1")
         .get();
       sid = row ? row.session_id : null;
     }
-    const args = [];
-    const base =
-      "SELECT model_id, output_tokens, reasoning_tokens, input_tokens, cache_read_input_tokens," +
-      " first_token_at, completed_at, time_to_first_token_ms, status" +
-      " FROM model_usage WHERE status = 'completed' AND query_source = 'main_turn'";
-    if (sid) {
-      args.push(sid);
+    if (!sid) return { sessionId: null, turnId: null, turn: null, session: null };
+    const { scopeSql, args } = scopeFor(db, sid);
+    const winRows = db.prepare(scopeSql + " ORDER BY completed_at DESC LIMIT ?").all(...args, N);
+    const session = sessionAggregate(db, scopeSql, args, winRows.map(toItem).filter((i) => i.tokPerSec != null));
+    const turnId = latestTurnId(db, sid);
+    if (!turnId) return { sessionId: sid, turnId: null, turn: null, session };
+    let turnRows;
+    try {
+      turnRows = db.prepare(scopeSql + " AND turn_id = ? ORDER BY completed_at ASC").all(...args, turnId);
+    } catch {
+      return { sessionId: sid, turnId: null, turn: null, session };
     }
-    // 主对话优先:无 main_turn 数据时回退为全部请求
-    const hasMain = db
-      .prepare(base.replace(" LIMIT ?", "") + (sid ? " AND session_id = ?" : "") + " LIMIT 1")
-      .get(...(sid ? [sid] : []));
-    const scopeSql = hasMain
-      ? base + " AND session_id = ?"
-      : base.replace(" AND query_source = 'main_turn'", "") + (sid ? " AND session_id = ?" : "");
-    // 曲线历史(大窗口)与统计(小窗口)分别查询,刷新/重开不丢
-    const histRows = db.prepare(scopeSql + " ORDER BY completed_at DESC LIMIT ?").all(...args, HIST);
-    const rows = histRows.slice(0, N);
-    const items = rows.map((r) => {
-      const tok = r.output_tokens ?? 0;
-      const reasoning = r.reasoning_tokens ?? 0;
-      // 部分行(如非流式/中断请求)缺 first_token_at,须判无效
-      const hasTime = Number.isFinite(r.first_token_at) && Number.isFinite(r.completed_at) && r.completed_at > r.first_token_at;
-      const genMs = hasTime ? r.completed_at - r.first_token_at : null; // 纯生成耗时(不含首 token 等待)
-      // 速率分子含思考 token:思考内容同样是流式输出,ZCode 未单独记录时该列为 0,行为不变
-      const rateTokens = tok + reasoning;
-      const valid = genMs != null && genMs >= MIN_GEN_MS && genMs < MAX_GEN_MS && rateTokens > 0;
-      return {
-        model: r.model_id,
-        outputTokens: tok,
-        reasoningTokens: reasoning,
-        inputTokens: r.input_tokens ?? 0,
-        cacheRead: r.cache_read_input_tokens ?? 0,
-        ttftMs: Number.isFinite(r.time_to_first_token_ms) ? r.time_to_first_token_ms : null,
-        genMs,
-        tokPerSec: valid ? Math.round((rateTokens / genMs) * 10000) / 10 : null,
-        completedAt: r.completed_at,
-      };
-    });
+    if (!turnRows.length) return { sessionId: sid, turnId, turn: null, session };
+    const items = turnRows.map(toItem);
     const rated = items.filter((i) => i.tokPerSec != null);
-    // 展示用 latest 优先取最近一条"有效"记录,避免在途/缺字段行顶掉头条
-    const latest = rated[0] ?? items[0] ?? null;
-    // 会话累计用独立 SUM(不受展示窗口限制);速率均值/峰值仍用近 N 窗口
-    const sumRow = db
-      .prepare(
-        "SELECT COUNT(*) n, SUM(output_tokens) o, SUM(reasoning_tokens) r," +
-        " SUM(input_tokens) i, SUM(cache_read_input_tokens) c FROM (" + scopeSql + ")"
-      )
-      .get(...args);
-    const session = rated.length
-      ? {
-          samples: rated.length,
-          requests: sumRow.n ?? 0,
-          avg: Math.round((rated.reduce((s, i) => s + i.tokPerSec, 0) / rated.length) * 10) / 10,
-          max: Math.max(...rated.map((i) => i.tokPerSec)),
-          min: Math.min(...rated.map((i) => i.tokPerSec)),
-          totalOutput: sumRow.o ?? 0,
-          totalReasoning: sumRow.r ?? 0,
-          totalInput: sumRow.i ?? 0,
-          totalCacheRead: sumRow.c ?? 0,
-        }
-      : null;
-    return { sessionId: sid, scoped, latest, session, history: items.slice().reverse() };
+    const totalTok = rated.reduce((s, i) => s + i.outputTokens + i.reasoningTokens, 0);
+    const genMs = rated.reduce((s, i) => s + i.genMs, 0);
+    const turn = {
+      requests: items.length,
+      rated: rated.length,
+      ttftMs: items[0].ttftMs, // 本轮第一段的首字延迟
+      firstAt: items[0].completedAt,
+      lastAt: items[items.length - 1].completedAt,
+      genMs,
+      totalOutput: items.reduce((s, i) => s + i.outputTokens, 0),
+      totalReasoning: items.reduce((s, i) => s + i.reasoningTokens, 0),
+      // 本轮即时速率:总产出 / 总纯生成时长(按段加权,排除段间工具等待),单段时即该段速率
+      tokPerSec: genMs >= MIN_GEN_MS && totalTok > 0 ? Math.round((totalTok / genMs) * 10000) / 10 : null,
+      peak: rated.length ? Math.max(...rated.map((i) => i.tokPerSec)) : null,
+    };
+    return { sessionId: sid, turnId, turn, session };
   } finally {
     db.close();
   }
@@ -136,21 +212,45 @@ function formatLine(r) {
   return parts.join(" · ");
 }
 
+// Stop 钩子用:回复刚结束时的本轮即时行
+function formatTurnLine(r) {
+  const t = r.turn;
+  if (!t) return "暂无本轮请求记录";
+  const time = new Date(t.lastAt).toLocaleTimeString("zh-CN", { hour12: false });
+  const parts = [
+    // 采样发生在回复刚结束的瞬间,头条即本轮即时速率
+    `⚡ ${t.tokPerSec ?? "-"} tok/s(本轮)`,
+    `首字 ${t.ttftMs != null ? (t.ttftMs / 1000).toFixed(1) : "-"}s`,
+    `输出 ${fmtNum(t.totalOutput)}${t.totalReasoning ? `(+${fmtNum(t.totalReasoning)} 思考)` : ""} tok / 生成 ${t.genMs > 0 ? (t.genMs / 1000).toFixed(1) : "-"}s`,
+  ];
+  if (t.requests > 1) parts.push(`${t.requests} 段 / 峰 ${t.peak ?? "-"}`);
+  if (r.session) parts.push(`累计 ${fmtCompact(r.session.totalOutput + r.session.totalReasoning)} tok`);
+  parts.push(`⏱ ${time}`);
+  return parts.join(" · ");
+}
+
 // --- CLI ---
 if (process.argv[1] && process.argv[1].endsWith("token-rate.mjs")) {
   const json = process.argv.includes("--json");
+  const turnOnly = process.argv.includes("--turn");
   const sid = process.env.ZCODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || null;
-  const r = query(sid);
-  if (json) {
-    console.log(JSON.stringify(r, null, 2));
+  if (turnOnly) {
+    const r = queryTurn(sid);
+    if (json) console.log(JSON.stringify(r, null, 2));
+    else console.log(formatTurnLine(r));
   } else {
-    const s = r.session;
-    console.log(formatLine(r));
-    if (s) {
-      // CLI 明细面向细读,全部千分位精确数字
-      console.log(`会话累计:输出 ${fmtNum(s.totalOutput)}${s.totalReasoning ? `(+${fmtNum(s.totalReasoning)} 思考)` : ""} tok · 输入 ${fmtNum(s.totalInput)} tok(其中缓存读 ${fmtNum(s.totalCacheRead)}) · 请求 ${s.requests} 次`);
+    const r = query(sid);
+    if (json) {
+      console.log(JSON.stringify(r, null, 2));
+    } else {
+      const s = r.session;
+      console.log(formatLine(r));
+      if (s) {
+        // CLI 明细面向细读,全部千分位精确数字
+        console.log(`会话累计:输出 ${fmtNum(s.totalOutput)}${s.totalReasoning ? `(+${fmtNum(s.totalReasoning)} 思考)` : ""} tok · 输入 ${fmtNum(s.totalInput)} tok(其中缓存读 ${fmtNum(s.totalCacheRead)}) · 请求 ${s.requests} 次`);
+      }
     }
   }
 }
 
-export { query, formatLine, fmtCompact, fmtNum };
+export { query, queryTurn, formatLine, formatTurnLine, fmtCompact, fmtNum };
